@@ -1,0 +1,50 @@
+// B) Brute-force por IP de origen (detectar ataques distribuidos)
+let lookback = 15m;
+let threshold = 5;
+Event
+| where TimeGenerated >= ago(lookback)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID == 18456
+| where RenderedDescription has "Login failed"
+| extend Account = coalesce(
+    extract(@"Login failed for user '([^']+)'", 1, RenderedDescription),
+    extract(@"login_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend ClientIP = coalesce(
+    extract(@"client_ip=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"Client:\s*([^;,\s\]]+)", 1, RenderedDescription),
+    extract(@"\[CLIENT:\s*([^\]]+)\]", 1, RenderedDescription)
+)
+| where isnotempty(ClientIP) and ClientIP != "UNKNOWN"
+// Resumen por IP
+| summarize 
+    FailedAttempts = count(),
+    DistinctAccounts = dcount(Account),
+    AccountsTargeted = make_set(Account),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    Servers = make_set(Computer)
+    by ClientIP
+| where FailedAttempts >= threshold
+| extend Severity = case(
+    DistinctAccounts >= 10, "CRITICAL",  // Ataque de diccionario
+    FailedAttempts >= 20, "HIGH",
+    "MEDIUM"
+)
+| extend AttackPattern = case(
+    DistinctAccounts >= 10, "Dictionary Attack",
+    DistinctAccounts <= 2, "Targeted Attack",
+    "Mixed Attack"
+)
+| project 
+    Severity,
+    ClientIP,
+    AttackPattern,
+    FailedAttempts,
+    DistinctAccounts,
+    AccountsTargeted,
+    Servers,
+    FirstSeen,
+    LastSeen
+| order by Severity desc, FailedAttempts desc
