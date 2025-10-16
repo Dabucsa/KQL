@@ -1,0 +1,56 @@
+Event
+| where TimeGenerated >= ago(24h)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID in (33205, 33206)
+| where RenderedDescription has_any ("DROP MEMBER", "sp_droprolemember", "sp_dropsrvrolemember", "ALTER SERVER ROLE")
+// Roles críticos de servidor
+| where RenderedDescription has_any (
+    "sysadmin",           // Control total
+    "securityadmin",      // Gestión de seguridad
+    "serveradmin",        // Configuración servidor
+    "setupadmin",         // Linked servers
+    "processadmin",       // Matar procesos
+    "diskadmin",          // Gestión de discos
+    "dbcreator"           // Crear bases de datos
+)
+| extend Executor = coalesce(
+    extract(@"principal_name=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"session_server_principal_name=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"login_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend UserRemoved = coalesce(
+    extract(@"member_name=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"target_principal_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend ServerRole = case(
+    RenderedDescription has "sysadmin", "sysadmin",
+    RenderedDescription has "securityadmin", "securityadmin",
+    RenderedDescription has "serveradmin", "serveradmin",
+    RenderedDescription has "setupadmin", "setupadmin",
+    RenderedDescription has "processadmin", "processadmin",
+    RenderedDescription has "diskadmin", "diskadmin",
+    RenderedDescription has "dbcreator", "dbcreator",
+    "UNKNOWN"
+)
+| extend Severity = case(
+    ServerRole in ("sysadmin", "securityadmin"), "CRITICAL",
+    ServerRole in ("serveradmin", "setupadmin"), "HIGH",
+    "MEDIUM"
+)
+| extend ActionResult = case(
+    EventID == 33205, "SUCCESS", 
+    EventID == 33206, "FAILURE", 
+    "UNKNOWN"
+)
+| project 
+    TimeGenerated, 
+    Computer,
+    Severity,
+    ServerRole,
+    ActionResult,
+    Executor, 
+    UserRemoved, 
+    EventID, 
+    RenderedDescription
+| order by Severity desc, TimeGenerated desc
