@@ -1,0 +1,45 @@
+// Detectar cambios críticos en configuración de SQL Server
+Event
+| where TimeGenerated >= ago(24h)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID in (33205, 33206)
+| where RenderedDescription has_any (
+    "sp_configure",
+    "xp_cmdshell",           // Ejecución de comandos OS
+    "Ole Automation",        // Automatización OLE
+    "remote access",         // Acceso remoto
+    "Ad Hoc",               // Queries distribuidas
+    "clr enabled",          // CLR (código .NET)
+    "Database Mail",        // Email
+    "SQL Server Agent"      // Configuración del agente
+)
+| extend Executor = coalesce(
+    extract(@"principal_name=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"login_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend ConfigOption = coalesce(
+    extract(@"sp_configure\s+'([^']+)'", 1, RenderedDescription),
+    extract(@"@configname\s*=\s*N?'([^']+)'", 1, RenderedDescription)
+)
+| extend NewValue = extract(@"value\s*=\s*(\d+)", 1, RenderedDescription)
+| extend Severity = case(
+    RenderedDescription has "xp_cmdshell", "CRITICAL",
+    RenderedDescription has "Ole Automation", "CRITICAL",
+    RenderedDescription has "clr enabled", "HIGH",
+    RenderedDescription has "remote access", "HIGH",
+    "MEDIUM"
+)
+| extend ActionResult = iff(EventID == 33205, "SUCCESS", "FAILURE")
+| where isnotempty(ConfigOption) or RenderedDescription has "sp_configure"
+| project 
+    TimeGenerated,
+    Computer,
+    Severity,
+    ActionResult,
+    Executor,
+    ConfigOption,
+    NewValue,
+    EventID,
+    RenderedDescription
+| order by Severity desc, TimeGenerated desc
