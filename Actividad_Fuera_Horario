@@ -1,0 +1,46 @@
+// Detectar actividad administrativa fuera de horario laboral
+Event
+| where TimeGenerated >= ago(7d)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID == 33205  // Solo eventos exitosos
+| where RenderedDescription has_any (
+    "CREATE", "DROP", "ALTER", "GRANT", "REVOKE",
+    "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER"
+)
+| extend Executor = coalesce(
+    extract(@"principal_name=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"login_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend Hour = hourofday(TimeGenerated)
+| extend DayOfWeek = dayofweek(TimeGenerated)
+| extend IsWeekend = iff(DayOfWeek == 0d or DayOfWeek == 6d, true, false)
+| extend IsNightTime = iff(Hour < 6 or Hour >= 22, true, false)
+| extend IsOffHours = iff(IsWeekend or IsNightTime, true, false)
+| where IsOffHours == true
+| extend Action = case(
+    RenderedDescription has "CREATE USER", "CREATE_USER",
+    RenderedDescription has "CREATE LOGIN", "CREATE_LOGIN",
+    RenderedDescription has "DROP", "DROP_OBJECT",
+    RenderedDescription has "ALTER", "ALTER_OBJECT",
+    RenderedDescription has "GRANT", "GRANT_PERMISSION",
+    RenderedDescription has "sp_configure", "CONFIG_CHANGE",
+    "OTHER"
+)
+| extend Severity = case(
+    Action in ("CREATE_LOGIN", "CONFIG_CHANGE") and IsNightTime, "CRITICAL",
+    IsWeekend, "HIGH",
+    "MEDIUM"
+)
+| project 
+    TimeGenerated,
+    Computer,
+    Severity,
+    Action,
+    Executor,
+    Hour,
+    DayOfWeek,
+    IsWeekend,
+    IsNightTime,
+    RenderedDescription
+| order by Severity desc, TimeGenerated desc
