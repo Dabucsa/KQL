@@ -1,0 +1,54 @@
+// Detectar cambios en permisos explícitos
+Event
+| where TimeGenerated >= ago(24h)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID in (33205, 33206)
+| where RenderedDescription has_any ("GRANT", "DENY", "REVOKE")
+| where RenderedDescription has_any (
+    "CONTROL SERVER",      // Control total
+    "ALTER ANY LOGIN",     // Modificar logins
+    "ALTER ANY USER",      // Modificar usuarios
+    "VIEW SERVER STATE",   // Ver estado del servidor
+    "IMPERSONATE",         // Suplantar identidad
+    "UNSAFE ASSEMBLY",     // Ensamblados no seguros
+    "EXTERNAL ACCESS"      // Acceso externo
+)
+| extend Executor = coalesce(
+    extract(@"principal_name=([^;,\s]+)", 1, RenderedDescription),
+    extract(@"login_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend TargetPrincipal = coalesce(
+    extract(@"TO\s+\[?([^\]\s,;]+)\]?", 1, RenderedDescription),
+    extract(@"FROM\s+\[?([^\]\s,;]+)\]?", 1, RenderedDescription),
+    extract(@"target_principal_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend Permission = coalesce(
+    extract(@"(?:GRANT|DENY|REVOKE)\s+([A-Z\s]+)(?:\s+TO|\s+FROM)", 1, RenderedDescription),
+    extract(@"permission_name=([^;,\s]+)", 1, RenderedDescription)
+)
+| extend Action = case(
+    RenderedDescription has "GRANT", "GRANT",
+    RenderedDescription has "DENY", "DENY",
+    RenderedDescription has "REVOKE", "REVOKE",
+    "UNKNOWN"
+)
+| extend Severity = case(
+    Permission has_any ("CONTROL SERVER", "ALTER ANY", "UNSAFE ASSEMBLY"), "CRITICAL",
+    Permission has_any ("IMPERSONATE", "VIEW SERVER STATE"), "HIGH",
+    "MEDIUM"
+)
+| extend ActionResult = iff(EventID == 33205, "SUCCESS", "FAILURE")
+| where isnotempty(Permission) or isnotempty(TargetPrincipal)
+| project 
+    TimeGenerated,
+    Computer,
+    Severity,
+    Action,
+    ActionResult,
+    Executor,
+    TargetPrincipal,
+    Permission,
+    EventID,
+    RenderedDescription
+| order by Severity desc, TimeGenerated desc
