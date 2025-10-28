@@ -1,6 +1,6 @@
 // ============================================
 // CAMBIOS DE PERMISOS, ROLES Y GRUPOS - AZURE ARC
-// GRANT, REVOKE, DENY, ADD MEMBER, sysadmin, db_owner
+// *** CON DESCRIPCIÓN DE ACCIÓN ***
 // ============================================
 
 Event
@@ -39,10 +39,13 @@ Event
 )
 // Clasificación de cambio
 | extend TipoCambio = case(
-    SQLStatement has "sysadmin", "SYSADMIN",
-    SQLStatement has "securityadmin", "SECURITYADMIN",
-    SQLStatement has "serveradmin", "SERVERADMIN",
-    SQLStatement has "db_owner", "DB_OWNER",
+    SQLStatement contains "sysadmin" or SQLStatement contains "'sysadmin'" or SQLStatement contains "[sysadmin]", "SYSADMIN",
+    SQLStatement contains "securityadmin" or SQLStatement contains "'securityadmin'" or SQLStatement contains "[securityadmin]", "SECURITYADMIN",
+    SQLStatement contains "serveradmin" or SQLStatement contains "'serveradmin'" or SQLStatement contains "[serveradmin]", "SERVERADMIN",
+    SQLStatement contains "db_owner" or SQLStatement contains "'db_owner'" or SQLStatement contains "[db_owner]", "DB_OWNER",
+    SQLStatement contains "db_securityadmin" or SQLStatement contains "'db_securityadmin'", "DB_SECURITYADMIN",
+    SQLStatement contains "db_accessadmin" or SQLStatement contains "'db_accessadmin'", "DB_ACCESSADMIN",
+    SQLStatement contains "db_ddladmin" or SQLStatement contains "'db_ddladmin'", "DB_DDLADMIN",
     SQLStatement has "GRANT CONTROL", "GRANT_CONTROL",
     SQLStatement has "GRANT ALTER", "GRANT_ALTER",
     SQLStatement has "GRANT", "GRANT_PERMISO",
@@ -52,12 +55,41 @@ Event
     SQLStatement has "DROP MEMBER" or SQLStatement has "sp_droprolemember" or SQLStatement has "sp_dropsrvrolemember", "QUITAR_DE_ROL",
     "CAMBIO_PERMISO"
 )
+// *** NUEVA: DESCRIPCIÓN DE LA ACCIÓN ***
+| extend TipoAccion = case(
+    SQLStatement has "sp_addsrvrolemember" or SQLStatement has "ALTER SERVER ROLE" and SQLStatement has "ADD MEMBER", "AGREGAR",
+    SQLStatement has "sp_dropsrvrolemember" or SQLStatement has "ALTER SERVER ROLE" and SQLStatement has "DROP MEMBER", "QUITAR",
+    SQLStatement has "sp_addrolemember" or SQLStatement has "ADD MEMBER", "AGREGAR",
+    SQLStatement has "sp_droprolemember" or SQLStatement has "DROP MEMBER", "QUITAR",
+    SQLStatement has "GRANT", "OTORGAR",
+    SQLStatement has "REVOKE", "REVOCAR",
+    SQLStatement has "DENY", "DENEGAR",
+    "CAMBIAR"
+)
+| extend DescripcionAccion = case(
+    TipoCambio == "SYSADMIN", strcat(TipoAccion, " rol SYSADMIN (Admin Total Servidor)"),
+    TipoCambio == "SECURITYADMIN", strcat(TipoAccion, " rol SECURITYADMIN (Gestión de Seguridad)"),
+    TipoCambio == "SERVERADMIN", strcat(TipoAccion, " rol SERVERADMIN (Configuración Servidor)"),
+    TipoCambio == "DB_OWNER", strcat(TipoAccion, " rol DB_OWNER (Dueño BD)"),
+    TipoCambio == "DB_SECURITYADMIN", strcat(TipoAccion, " rol DB_SECURITYADMIN (Seguridad BD)"),
+    TipoCambio == "DB_ACCESSADMIN", strcat(TipoAccion, " rol DB_ACCESSADMIN (Acceso BD)"),
+    TipoCambio == "DB_DDLADMIN", strcat(TipoAccion, " rol DB_DDLADMIN (Estructura BD)"),
+    TipoCambio == "GRANT_CONTROL", "OTORGAR permiso CONTROL (Control Total)",
+    TipoCambio == "GRANT_ALTER", "OTORGAR permiso ALTER (Modificar Objetos)",
+    TipoCambio == "GRANT_PERMISO", "OTORGAR permiso específico",
+    TipoCambio == "REVOKE_PERMISO", "REVOCAR permiso",
+    TipoCambio == "DENY_PERMISO", "DENEGAR permiso",
+    TipoCambio == "AGREGAR_A_ROL", strcat(TipoAccion, " a rol de BD"),
+    TipoCambio == "QUITAR_DE_ROL", strcat(TipoAccion, " de rol de BD"),
+    "Cambio de permiso"
+)
 // Extracción de usuario/login afectado
 | extend UsuarioAfectado = extract(@"\[([^\]]+)\]|'([^']+)'", 1, SQLStatement)
 // Proyecto final
 | project 
     FechaHora = TimeGenerated,
     TipoCambio,
+    DescripcionAccion,  // *** NUEVA COLUMNA ***
     QuienHizoCambio = Usuario,
     TipoUsuario,
     UsuarioAfectado,
