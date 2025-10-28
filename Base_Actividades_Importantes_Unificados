@@ -1,15 +1,13 @@
 // ============================================
-// FUNCIÓN PARAMETRIZADA
-// Parámetros:
-//   - dias: Días a consultar (default: 7)
-//   - soloFueraHorario: true/false (default: true)
-//   - limitePorFuente: Eventos por fuente (default: 100)
+// PARÁMETROS DE CONFIGURACIÓN
 // ============================================
-
-let dias = 7;
-let soloFueraHorario = false;  // *** CAMBIAR A false PARA VER TODAS ***
-let limitePorFuente = 100;
-// PARTE 1: AZURE ARC
+let dias = 7;                    // Días hacia atrás a consultar
+let soloFueraHorario = false;     // true = solo fuera de horario, false = todos
+let limitePorFuente = 1000;       // Registros por fuente (Arc/Logstash)
+let limiteResultadoFinal = 500;   // Registros en resultado final
+// ============================================
+// PARTE 1: DATOS DE AZURE ARC
+// ============================================
 let ArcData = materialize(
     Event
     | where TimeGenerated >= ago(dias * 1d)
@@ -20,13 +18,14 @@ let ArcData = materialize(
         "CREATE", "DROP", "ALTER", "GRANT", "REVOKE",
         "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER", "DENY"
     )
-    // Calcular horario
+    // Cálculo de horario
     | extend Hour = hourofday(TimeGenerated)
     | extend DayOfWeek = dayofweek(TimeGenerated)
     | extend IsOffHours = iff((DayOfWeek == 0d or DayOfWeek == 6d) or (Hour < 6 or Hour >= 22), true, false)
-    // Filtrar solo si se requiere
+    // Filtro condicional de horario
     | where soloFueraHorario == false or IsOffHours == true
-    | top limitePorFuente by TimeGenerated desc   
+    | top limitePorFuente by TimeGenerated desc
+    // Extracciones de usuario
     | extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
     | extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
     | extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription))
@@ -36,10 +35,12 @@ let ArcData = materialize(
         iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
         "NO_IDENTIFICADO"
     )
+    // Extracciones básicas
     | extend DatabaseName = trim(@"\s", extract(@"database_name:([^\s]+)", 1, RenderedDescription))
     | extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
     | extend ActionID = extract(@"action_id:([^\s]+)", 1, RenderedDescription)
     | extend Succeeded = extract(@"succeeded:([^\s]+)", 1, RenderedDescription)
+    // Extracción de tabla/objeto
     | extend SchemaName = trim(@"\s", extract(@"schema_name:([^\s]+)", 1, RenderedDescription))
     | extend ObjectName = trim(@"\s", extract(@"object_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+statement:|$)", 1, RenderedDescription))
     | extend ObjetoAfectado = case(
@@ -51,9 +52,12 @@ let ArcData = materialize(
     | extend Origen = "AzureArc"
     | extend DetallesCompletos = RenderedDescription
     | extend FechaEvento = TimeGenerated
-    | project FechaEvento, Servidor, Usuario, DatabaseName, SQLStatement, ActionID, Succeeded, Origen, DetallesCompletos, Hour, DayOfWeek, ObjetoAfectado, IsOffHours
+    | project FechaEvento, Servidor, Usuario, DatabaseName, SQLStatement, ActionID, Succeeded, 
+              Origen, DetallesCompletos, Hour, DayOfWeek, ObjetoAfectado, IsOffHours
 );
-// PARTE 2: LOGSTASH
+// ============================================
+// PARTE 2: DATOS DE LOGSTASH
+// ============================================
 let LogstashData = materialize(
     SQLAudit
     | where ['TimeGenerated [UTC]'] >= ago(dias * 1d)
@@ -62,11 +66,13 @@ let LogstashData = materialize(
         "CREATE", "DROP", "ALTER", "GRANT", "REVOKE",
         "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER", "DENY"
     )
+    // Cálculo de horario
     | extend Hour = hourofday(['TimeGenerated [UTC]'])
     | extend DayOfWeek = dayofweek(['TimeGenerated [UTC]'])
     | extend IsOffHours = iff((DayOfWeek == 0d or DayOfWeek == 6d) or (Hour < 6 or Hour >= 22), true, false)
+    // Filtro condicional de horario
     | where soloFueraHorario == false or IsOffHours == true
-    | top limitePorFuente by ['TimeGenerated [UTC]'] desc    
+    | top limitePorFuente by ['TimeGenerated [UTC]'] desc
     | extend Usuario = coalesce(CurrentUser, "DESCONOCIDO")
     | extend Servidor = coalesce(Server_name, Instance, "DESCONOCIDO")
     | extend DatabaseName = Database
@@ -76,6 +82,7 @@ let LogstashData = materialize(
     | extend Origen = "Logstash"
     | extend DetallesCompletos = Message
     | extend FechaEvento = ['TimeGenerated [UTC]']
+    // Extracción de tabla
     | extend TablaDirecta = iff(isnotempty(Table), Table, "")
     | extend TablaExtraida = case(
         SQLStatement matches regex @"\[?([a-zA-Z0-9_]+)\]?\.\[?([a-zA-Z0-9_]+)\]?", 
@@ -85,15 +92,18 @@ let LogstashData = materialize(
         SQLStatement has "UPDATE STATISTICS",
             extract(@"UPDATE STATISTICS\s+\[?([a-zA-Z0-9_\.]+)\]?", 1, SQLStatement),
         ""
-        )
+    )
     | extend ObjetoAfectado = case(
         isnotempty(TablaDirecta), TablaDirecta,
         isnotempty(TablaExtraida), TablaExtraida,
         "N/A"
     )
-    | project FechaEvento, Servidor, Usuario, DatabaseName, SQLStatement, ActionID, Succeeded, Origen, DetallesCompletos, Hour, DayOfWeek, ObjetoAfectado, IsOffHours
+    | project FechaEvento, Servidor, Usuario, DatabaseName, SQLStatement, ActionID, Succeeded, 
+              Origen, DetallesCompletos, Hour, DayOfWeek, ObjetoAfectado, IsOffHours
 );
-// UNION Y PROCESAMIENTO
+// ============================================
+// UNION Y PROCESAMIENTO COMÚN
+// ============================================
 union isfuzzy=true ArcData, LogstashData
 | extend DayName = case(
     DayOfWeek == 0d, "Domingo",
@@ -160,12 +170,12 @@ union isfuzzy=true ArcData, LogstashData
 )
 | extend Severidad = case(
     Accion contains "COMANDO_SISTEMA" or Accion contains "CONFIGURACION_SERVIDOR", "CRITICO",
-    (Accion contains "CREAR_LOGIN" or Accion contains "ELIMINAR_LOGIN" or Accion contains "ELIMINAR_BD") and IsOffHours and TipoUsuario != "CUENTA_SISTEMA", "CRITICO",
+    (Accion contains "CREAR_LOGIN" or Accion contains "ELIMINAR_LOGIN" or Accion contains "ELIMINAR_BD") and (Hour < 6 or Hour >= 22) and TipoUsuario != "CUENTA_SISTEMA", "CRITICO",
     Accion contains "CREAR_LOGIN" or Accion contains "ELIMINAR_LOGIN" or Accion contains "ELIMINAR_BD", "ALTO",
     Accion contains "AGREGAR_A_ROL" or Accion contains "OTORGAR_CONTROL", "ALTO",
     Accion contains "BACKUP_BD" or Accion contains "RESTORE_BD", "ALTO",
     (Accion contains "CREAR" or Accion contains "MODIFICAR") and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
-    IsOffHours and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
+    (DayOfWeek == 0d or DayOfWeek == 6d) and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
     Accion == "SELECT_CONSULTA" and TipoUsuario == "CUENTA_SISTEMA", "INFO",
     TipoUsuario == "CUENTA_SISTEMA" or TipoUsuario == "CUENTA_MAQUINA", "BAJO",
     "MEDIO"
@@ -179,6 +189,7 @@ union isfuzzy=true ArcData, LogstashData
     iff(ObjetoAfectado != "N/A", strcat(" -> Tabla: ", ObjetoAfectado), ""),
     " [", Origen, "]"
 )
+// PROYECCIÓN FINAL
 | project 
     FechaHora = FechaEvento,
     Dia = DayName,
@@ -197,3 +208,4 @@ union isfuzzy=true ArcData, LogstashData
     OrigenDatos = Origen,
     DetallesCompletos
 | order by Severidad desc, FechaHora desc
+| take 100
