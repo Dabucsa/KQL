@@ -1,0 +1,69 @@
+// ============================================
+// TODAS LAS ACTIVIDADES POR USUARIO
+// Azure Arc + Logstash
+// Últimos 7 días
+// ============================================
+let dias = 7;
+// ============================================
+// ACTIVIDADES DESDE AZURE ARC
+// ============================================
+let ArcActividades = Event
+| where TimeGenerated >= ago(dias * 1d)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID == 33205
+// Extraer usuario
+| extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
+| extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
+| extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription))
+| extend Usuario = coalesce(
+    iff(DatabasePrincipalName != "" and DatabasePrincipalName != "dbo", DatabasePrincipalName, ""),
+    iff(ServerPrincipalName != "", ServerPrincipalName, ""),
+    iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
+    "NO_IDENTIFICADO"
+)
+// Extraer acción
+| extend ActionID = extract(@"action_id:([^\s]+)", 1, RenderedDescription)
+| extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
+| extend Servidor = Computer
+| extend Origen = "AzureArc"
+| extend FechaEvento = TimeGenerated
+| project FechaEvento, Usuario, Servidor, ActionID, SQLStatement, Origen;
+// ============================================
+// ACTIVIDADES DESDE LOGSTASH
+// ============================================
+let LogstashActividades = SQLAudit
+| where ['TimeGenerated [UTC]'] >= ago(dias * 1d)
+| where isnotempty(CurrentUser)
+| extend Usuario = coalesce(CurrentUser, "DESCONOCIDO")
+| extend Servidor = coalesce(Server_name, Instance, "DESCONOCIDO")
+| extend ActionID = Action
+| extend SQLStatement = Statement
+| extend Origen = "Logstash"
+| extend FechaEvento = ['TimeGenerated [UTC]']
+| project FechaEvento, Usuario, Servidor, ActionID, SQLStatement, Origen;
+// ============================================
+// UNION Y RESUMEN POR USUARIO
+// ============================================
+union ArcActividades, LogstashActividades
+| summarize 
+    TotalActividades = count(),
+    AccionesUnicas = dcount(ActionID),
+    ListaAcciones = make_set(ActionID, 20),
+    PrimeraActividad = min(FechaEvento),
+    UltimaActividad = max(FechaEvento),
+    ServidoresUsados = dcount(Servidor),
+    ListaServidores = make_set(Servidor, 10),
+    Fuentes = make_set(Origen)
+by Usuario
+| project 
+    Usuario,
+    TotalActividades,
+    AccionesUnicas,
+    ListaAcciones,
+    ServidoresUsados,
+    PrimeraActividad,
+    UltimaActividad,
+    ListaServidores,
+    Fuentes
+| order by TotalActividades desc
