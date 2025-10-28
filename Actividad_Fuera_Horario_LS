@@ -1,0 +1,150 @@
+// ============================================
+// QUERY PARA LOGSTASH (SQLAudit)
+// Detectar actividad administrativa fuera de horario
+// ============================================
+
+SQLAudit
+| where ['TimeGenerated [UTC]'] >= ago(7d)
+| where isnotempty(Statement)
+| where Statement has_any (
+    "CREATE", "DROP", "ALTER", "GRANT", "REVOKE",
+    "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER", "DENY",
+    "UPDATE", "INSERT", "DELETE", "BACKUP", "RESTORE", "TRUNCATE"
+)
+// Cálculos de tiempo
+| extend Hour = hourofday(['TimeGenerated [UTC]'])
+| extend DayOfWeek = dayofweek(['TimeGenerated [UTC]'])
+| extend IsWeekend = iff(DayOfWeek == 0d or DayOfWeek == 6d, true, false)
+| extend IsNightTime = iff(Hour < 6 or Hour >= 22, true, false)
+| extend IsOffHours = iff(IsWeekend or IsNightTime, true, false)
+| where IsOffHours == true
+// Formato legible de fecha y hora
+| extend DayName = case(
+    DayOfWeek == 0d, "Domingo",
+    DayOfWeek == 1d, "Lunes",
+    DayOfWeek == 2d, "Martes",
+    DayOfWeek == 3d, "Miercoles",
+    DayOfWeek == 4d, "Jueves",
+    DayOfWeek == 5d, "Viernes",
+    DayOfWeek == 6d, "Sabado",
+    "Desconocido"
+)
+| extend TimeSlot = case(
+    Hour >= 0 and Hour < 6, strcat("Madrugada (", Hour, ":00)"),
+    Hour >= 6 and Hour < 12, strcat("Manana (", Hour, ":00)"),
+    Hour >= 12 and Hour < 18, strcat("Tarde (", Hour, ":00)"),
+    Hour >= 18 and Hour < 22, strcat("Noche (", Hour, ":00)"),
+    strcat("Noche Avanzada (", Hour, ":00)")
+)
+// Normalización de campos
+| extend Usuario = coalesce(CurrentUser, "DESCONOCIDO")
+| extend Servidor = coalesce(Server_name, Instance, "DESCONOCIDO")
+| extend BaseDatos = iff(isempty(Database) or isnull(Database), "N/A", Database)
+| extend SQLStatement = Statement
+| extend ActionType = Action
+// Tipo de usuario
+| extend TipoUsuario = case(
+    Usuario contains "NT AUTHORITY" or Usuario contains "NT SERVICE", "CUENTA_SISTEMA",
+    Usuario endswith "$", "CUENTA_MAQUINA",
+    Usuario =~ "sa", "SA_ADMIN",
+    Usuario contains "\\", "CUENTA_DOMINIO",
+    "USUARIO_SQL"
+)
+// Clasificación de acciones (mejorada)
+| extend Accion = case(
+    // CRITICAS
+    SQLStatement has "xp_cmdshell", "COMANDO_SISTEMA_xp_cmdshell",
+    SQLStatement has "sp_configure", "CONFIGURACION_SERVIDOR",
+    SQLStatement has "sp_addlinkedserver", "SERVIDOR_VINCULADO",
+    // LOGINS
+    SQLStatement has "CREATE LOGIN", "CREAR_LOGIN",
+    SQLStatement has "DROP LOGIN", "ELIMINAR_LOGIN",
+    SQLStatement has "ALTER LOGIN", "MODIFICAR_LOGIN",
+    // USUARIOS
+    SQLStatement has "CREATE USER", "CREAR_USUARIO",
+    SQLStatement has "DROP USER", "ELIMINAR_USUARIO",
+    SQLStatement has "ALTER USER", "MODIFICAR_USUARIO",
+    // ROLES Y PERMISOS
+    SQLStatement has "ADD MEMBER" or SQLStatement has "sp_addrolemember", "AGREGAR_A_ROL",
+    SQLStatement has "DROP MEMBER" or SQLStatement has "sp_droprolemember", "QUITAR_DE_ROL",
+    SQLStatement has "GRANT CONTROL", "OTORGAR_CONTROL",
+    SQLStatement has "GRANT ALTER", "OTORGAR_ALTER",
+    SQLStatement has "GRANT", "OTORGAR_PERMISO",
+    SQLStatement has "REVOKE", "REVOCAR_PERMISO",
+    SQLStatement has "DENY", "DENEGAR_PERMISO",
+    // BASES DE DATOS
+    SQLStatement has "CREATE DATABASE", "CREAR_BD",
+    SQLStatement has "DROP DATABASE", "ELIMINAR_BD",
+    SQLStatement has "ALTER DATABASE", "MODIFICAR_BD",
+    SQLStatement has "BACKUP DATABASE", "BACKUP_BD",
+    SQLStatement has "RESTORE DATABASE", "RESTORE_BD",
+    // TABLAS
+    SQLStatement has "CREATE TABLE", "CREAR_TABLA",
+    SQLStatement has "DROP TABLE", "ELIMINAR_TABLA",
+    SQLStatement has "ALTER TABLE", "MODIFICAR_TABLA",
+    SQLStatement has "TRUNCATE TABLE", "TRUNCAR_TABLA",
+    // PROCEDURES/VIEWS
+    SQLStatement has "CREATE PROCEDURE", "CREAR_PROCEDURE",
+    SQLStatement has "DROP PROCEDURE", "ELIMINAR_PROCEDURE",
+    SQLStatement has "CREATE VIEW", "CREAR_VIEW",
+    SQLStatement has "DROP VIEW", "ELIMINAR_VIEW",
+    // Genéricos
+    SQLStatement has "CREATE" or ActionType has "CREATE", "CREAR_OTRO",
+    SQLStatement has "DROP" or ActionType has "DROP", "ELIMINAR_OTRO",
+    SQLStatement has "ALTER" or ActionType has "ALTER", "MODIFICAR_OTRO",
+    SQLStatement has "INSERT", "INSERT_DATOS",
+    SQLStatement has "UPDATE" or ActionType has "UPDATE", "UPDATE_DATOS",
+    SQLStatement has "DELETE", "DELETE_DATOS",
+    SQLStatement has "SELECT", "SELECT_CONSULTA",
+    strcat("NO_CLASIFICADO_", ActionType)
+)
+// Severidad (mismo criterio que Azure Arc)
+| extend Severidad = case(
+    // Critico
+    Accion contains "COMANDO_SISTEMA" or Accion contains "CONFIGURACION_SERVIDOR", "CRITICO",
+    (Accion contains "CREAR_LOGIN" or Accion contains "ELIMINAR_LOGIN" or Accion contains "ELIMINAR_BD") and IsNightTime and TipoUsuario != "CUENTA_SISTEMA", "CRITICO",
+    // Alto
+    Accion contains "CREAR_LOGIN" or Accion contains "ELIMINAR_LOGIN" or Accion contains "ELIMINAR_BD", "ALTO",
+    Accion contains "AGREGAR_A_ROL" or Accion contains "OTORGAR_CONTROL", "ALTO",
+    Accion contains "BACKUP_BD" or Accion contains "RESTORE_BD", "ALTO",
+    // Medio
+    (Accion contains "CREAR" or Accion contains "MODIFICAR") and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
+    IsWeekend and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
+    // Bajo (operaciones normales o de sistema)
+    Accion == "SELECT_CONSULTA" and TipoUsuario == "CUENTA_SISTEMA", "INFO",
+    TipoUsuario == "CUENTA_SISTEMA" or TipoUsuario == "CUENTA_MAQUINA", "BAJO",
+    "MEDIO"
+)
+// Extracción mejorada del objeto afectado desde Statement
+| extend ObjetoAfectado = case(
+    SQLStatement has "UPDATE STATISTICS", extract(@"UPDATE STATISTICS \[?([^\]]+)\]?\.?\[?([^\]]+)?\]?", 1, SQLStatement),
+    SQLStatement matches regex @"\[dbo\]\.\[([^\]]+)\]", extract(@"\[dbo\]\.\[([^\]]+)\]", 1, SQLStatement),
+    SQLStatement matches regex @"ON \[?([^\]]+)\]?", extract(@"ON \[?([^\]]+)\]?", 1, SQLStatement),
+    "N/A"
+)
+// Resumen ejecutivo
+| extend Resumen = strcat(
+    Usuario, " (", TipoUsuario, ") ejecuto ",
+    Accion,
+    iff(BaseDatos != "N/A", strcat(" en BD: ", BaseDatos), ""),
+    iff(ObjetoAfectado != "N/A", strcat(" -> ", ObjetoAfectado), "")
+)
+// Proyecto final
+| project 
+    FechaHora = ['TimeGenerated [UTC]'],
+    Dia = DayName,
+    Horario = TimeSlot,
+    Servidor = Servidor,
+    Usuario = Usuario,
+    TipoUsuario = TipoUsuario,
+    Accion = Accion,
+    Severidad = Severidad,
+    BaseDatos = BaseDatos,
+    Objeto = ObjetoAfectado,
+    Resumen = Resumen,
+    Statement = SQLStatement,
+    HostOrigen = host_name_s,
+    VersionSQL = VersionSQL,
+    DetallesCompletos = Message
+| order by Severidad desc, FechaHora desc
+| take 100
