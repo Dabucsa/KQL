@@ -1,9 +1,9 @@
 // ============================================
 // QUERY UNIFICADA SIMPLIFICADA
 // Azure Arc + Logstash
-// Actividad administrativa fuera de horario
+// Actividad administrativa FUERA DE HORARIO
+// *** CORREGIDO: Logstash usa hora real del evento SQL ***
 // ============================================
-
 // ============================================
 // PARTE 1: DATOS DE AZURE ARC
 // ============================================
@@ -54,7 +54,7 @@ let ArcData = materialize(
               Origen, DetallesCompletos, Hour, DayOfWeek, ObjetoAfectado
 );
 // ============================================
-// PARTE 2: DATOS DE LOGSTASH
+// PARTE 2: DATOS DE LOGSTASH (*** CORREGIDO ***)
 // ============================================
 let LogstashData = materialize(
     SQLAudit
@@ -64,12 +64,16 @@ let LogstashData = materialize(
         "CREATE", "DROP", "ALTER", "GRANT", "REVOKE",
         "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER", "DENY"
     )
-    // Filtro de horario
-    | extend Hour = hourofday(['TimeGenerated [UTC]'])
-    | extend DayOfWeek = dayofweek(['TimeGenerated [UTC]'])
+    // *** EXTRACCIÓN DE HORA REAL DEL EVENTO SQL ***
+    | extend EventTimeRaw = extract(@"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)", 1, Message)
+    | extend EventTime = todatetime(EventTimeRaw)
+    | extend FechaHoraEvento = coalesce(EventTime, ['TimeGenerated [UTC]'])  // Fallback si no se extrae   
+    // Filtro de horario CORREGIDO (usa hora real del evento SQL)
+    | extend Hour = hourofday(FechaHoraEvento)
+    | extend DayOfWeek = dayofweek(FechaHoraEvento)
     | extend IsOffHours = iff((DayOfWeek == 0d or DayOfWeek == 6d) or (Hour < 6 or Hour >= 22), true, false)
     | where IsOffHours == true
-    | top 100 by ['TimeGenerated [UTC]'] desc
+    | top 100 by FechaHoraEvento desc  // *** CAMBIADO: ordena por hora real ***   
     | extend Usuario = coalesce(CurrentUser, "DESCONOCIDO")
     | extend Servidor = coalesce(Server_name, Instance, "DESCONOCIDO")
     | extend DatabaseName = Database
@@ -78,7 +82,7 @@ let LogstashData = materialize(
     | extend Succeeded = "true"
     | extend Origen = "Logstash"
     | extend DetallesCompletos = Message
-    | extend FechaEvento = ['TimeGenerated [UTC]']
+    | extend FechaEvento = FechaHoraEvento  // *** CAMBIADO: usa hora real ***   
     // Extracción de tabla
     | extend TablaDirecta = iff(isnotempty(Table), Table, "")
     | extend TablaExtraida = case(
@@ -204,4 +208,4 @@ union isfuzzy=true ArcData, LogstashData
     OrigenDatos = Origen,
     DetallesCompletos
 | order by Severidad desc, FechaHora desc
-| take 500
+| take 1000
