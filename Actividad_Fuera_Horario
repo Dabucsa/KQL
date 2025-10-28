@@ -1,46 +1,162 @@
-// Detectar actividad administrativa fuera de horario laboral
+// Detectar actividad administrativa fuera de horario laboral 
 Event
 | where TimeGenerated >= ago(7d)
 | where EventLog == "Application"
 | where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
-| where EventID == 33205  // Solo eventos exitosos
+| where EventID == 33205
 | where RenderedDescription has_any (
     "CREATE", "DROP", "ALTER", "GRANT", "REVOKE",
-    "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER"
+    "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER", "DENY"
 )
-| extend Executor = coalesce(
-    extract(@"principal_name=([^;,\s]+)", 1, RenderedDescription),
-    extract(@"login_name=([^;,\s]+)", 1, RenderedDescription)
-)
+// Cálculos de tiempo
 | extend Hour = hourofday(TimeGenerated)
 | extend DayOfWeek = dayofweek(TimeGenerated)
 | extend IsWeekend = iff(DayOfWeek == 0d or DayOfWeek == 6d, true, false)
 | extend IsNightTime = iff(Hour < 6 or Hour >= 22, true, false)
 | extend IsOffHours = iff(IsWeekend or IsNightTime, true, false)
 | where IsOffHours == true
+// Formato legible de fecha y hora
+| extend DayName = case(
+    DayOfWeek == 0d, "Domingo",
+    DayOfWeek == 1d, "Lunes",
+    DayOfWeek == 2d, "Martes",
+    DayOfWeek == 3d, "Miercoles",
+    DayOfWeek == 4d, "Jueves",
+    DayOfWeek == 5d, "Viernes",
+    DayOfWeek == 6d, "Sabado",
+    "Desconocido"
+)
+| extend TimeSlot = case(
+    Hour >= 0 and Hour < 6, strcat("Madrugada (", Hour, ":00)"),
+    Hour >= 6 and Hour < 12, strcat("Manana (", Hour, ":00)"),
+    Hour >= 12 and Hour < 18, strcat("Tarde (", Hour, ":00)"),
+    Hour >= 18 and Hour < 22, strcat("Noche (", Hour, ":00)"),
+    strcat("Noche Avanzada (", Hour, ":00)")
+)
+// EXTRACCION CORREGIDA - Patron: campo:valor (separado por espacios)
+| extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
+| extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
+| extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription))
+// Elegir el usuario más apropiado (priorizar DatabasePrincipal > ServerPrincipal > SessionServer)
+| extend Executor = coalesce(
+    iff(DatabasePrincipalName != "" and DatabasePrincipalName != "dbo", DatabasePrincipalName, ""),
+    iff(ServerPrincipalName != "", ServerPrincipalName, ""),
+    iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
+    "NO_IDENTIFICADO"
+)
+// Identificar si es cuenta de sistema o cuenta de maquina
+| extend TipoUsuario = case(
+    Executor contains "NT AUTHORITY" or Executor contains "NT SERVICE", "CUENTA_SISTEMA",
+    Executor endswith "$", "CUENTA_MAQUINA",
+    Executor == "sa", "SA_ADMIN",
+    Executor contains "\\", "CUENTA_DOMINIO",
+    "USUARIO_SQL"
+)
+// Extracción de base de datos
+| extend DatabaseName = trim(@"\s", extract(@"database_name:([^\s]+)", 1, RenderedDescription))
+| extend DatabaseName = iff(DatabaseName == "", "N/A", DatabaseName)
+// Extracción del objeto afectado
+| extend SchemaName = trim(@"\s", extract(@"schema_name:([^\s]+)", 1, RenderedDescription))
+| extend ObjectName = trim(@"\s", extract(@"object_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+statement:|$)", 1, RenderedDescription))
+| extend TargetObject = iff(SchemaName != "" and ObjectName != "", 
+    strcat(SchemaName, ".", ObjectName), 
+    iff(ObjectName != "", ObjectName, "N/A"))
+// Extracción del statement SQL
+| extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
+// Extracción del action_id para clasificar mejor
+| extend ActionID = extract(@"action_id:([^\s]+)", 1, RenderedDescription)
+| extend Succeeded = extract(@"succeeded:([^\s]+)", 1, RenderedDescription)
+// Clasificación detallada de acciones (mejorada con statement)
 | extend Action = case(
-    RenderedDescription has "CREATE USER", "CREATE_USER",
-    RenderedDescription has "CREATE LOGIN", "CREATE_LOGIN",
-    RenderedDescription has "DROP", "DROP_OBJECT",
-    RenderedDescription has "ALTER", "ALTER_OBJECT",
-    RenderedDescription has "GRANT", "GRANT_PERMISSION",
-    RenderedDescription has "sp_configure", "CONFIG_CHANGE",
-    "OTHER"
+    // CRITICAS
+    RenderedDescription has "xp_cmdshell" or SQLStatement has "xp_cmdshell", "COMANDO_SISTEMA_xp_cmdshell",
+    RenderedDescription has "sp_configure" or SQLStatement has "sp_configure", "CONFIGURACION_SERVIDOR",
+    RenderedDescription has "sp_addlinkedserver", "SERVIDOR_VINCULADO",
+    // LOGINS
+    SQLStatement has "CREATE LOGIN" or RenderedDescription has "CREATE LOGIN", "CREAR_LOGIN",
+    SQLStatement has "DROP LOGIN" or RenderedDescription has "DROP LOGIN", "ELIMINAR_LOGIN",
+    SQLStatement has "ALTER LOGIN" or RenderedDescription has "ALTER LOGIN", "MODIFICAR_LOGIN",
+    // USUARIOS
+    SQLStatement has "CREATE USER" or RenderedDescription has "CREATE USER", "CREAR_USUARIO",
+    SQLStatement has "DROP USER" or RenderedDescription has "DROP USER", "ELIMINAR_USUARIO",
+    SQLStatement has "ALTER USER" or RenderedDescription has "ALTER USER", "MODIFICAR_USUARIO",
+    // ROLES Y PERMISOS
+    SQLStatement has "ADD MEMBER" or SQLStatement has "sp_addrolemember", "AGREGAR_A_ROL",
+    SQLStatement has "DROP MEMBER" or SQLStatement has "sp_droprolemember", "QUITAR_DE_ROL",
+    SQLStatement has "GRANT CONTROL", "OTORGAR_CONTROL",
+    SQLStatement has "GRANT ALTER", "OTORGAR_ALTER",
+    SQLStatement has "GRANT", "OTORGAR_PERMISO",
+    SQLStatement has "REVOKE", "REVOCAR_PERMISO",
+    SQLStatement has "DENY", "DENEGAR_PERMISO",
+    // BASES DE DATOS
+    SQLStatement has "CREATE DATABASE", "CREAR_BD",
+    SQLStatement has "DROP DATABASE", "ELIMINAR_BD",
+    SQLStatement has "ALTER DATABASE", "MODIFICAR_BD",
+    SQLStatement has "BACKUP DATABASE", "BACKUP_BD",
+    SQLStatement has "RESTORE DATABASE", "RESTORE_BD",
+    // TABLAS
+    SQLStatement has "CREATE TABLE", "CREAR_TABLA",
+    SQLStatement has "DROP TABLE", "ELIMINAR_TABLA",
+    SQLStatement has "ALTER TABLE", "MODIFICAR_TABLA",
+    SQLStatement has "TRUNCATE TABLE", "TRUNCAR_TABLA",
+    // PROCEDURES/VIEWS
+    SQLStatement has "CREATE PROCEDURE", "CREAR_PROCEDURE",
+    SQLStatement has "DROP PROCEDURE", "ELIMINAR_PROCEDURE",
+    SQLStatement has "CREATE VIEW", "CREAR_VIEW",
+    SQLStatement has "DROP VIEW", "ELIMINAR_VIEW",
+    // SELECT (consultas de lectura - puede ser normal)
+    SQLStatement has "SELECT" and ActionID == "SL", "SELECT_CONSULTA",
+    // Genéricos
+    SQLStatement has "CREATE" or RenderedDescription has "CREATE", "CREAR_OTRO",
+    SQLStatement has "DROP" or RenderedDescription has "DROP", "ELIMINAR_OTRO",
+    SQLStatement has "ALTER" or RenderedDescription has "ALTER", "MODIFICAR_OTRO",
+    SQLStatement has "INSERT", "INSERT_DATOS",
+    SQLStatement has "UPDATE", "UPDATE_DATOS",
+    SQLStatement has "DELETE", "DELETE_DATOS",
+    // Fallback
+    strcat("NO_CLASIFICADO_", ActionID)
 )
+// Severidad mejorada (considerar tipo de usuario)
 | extend Severity = case(
-    Action in ("CREATE_LOGIN", "CONFIG_CHANGE") and IsNightTime, "CRITICAL",
-    IsWeekend, "HIGH",
-    "MEDIUM"
+    // Critico
+    Action contains "COMANDO_SISTEMA" or Action contains "CONFIGURACION_SERVIDOR", "CRITICO",
+    (Action contains "CREAR_LOGIN" or Action contains "ELIMINAR_LOGIN" or Action contains "ELIMINAR_BD") and IsNightTime and TipoUsuario != "CUENTA_SISTEMA", "CRITICO",
+    // Alto
+    Action contains "CREAR_LOGIN" or Action contains "ELIMINAR_LOGIN" or Action contains "ELIMINAR_BD", "ALTO",
+    Action contains "AGREGAR_A_ROL" or Action contains "OTORGAR_CONTROL", "ALTO",
+    Action contains "BACKUP_BD" or Action contains "RESTORE_BD", "ALTO",
+    // Medio
+    (Action contains "CREAR" or Action contains "MODIFICAR") and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
+    IsWeekend and TipoUsuario != "CUENTA_SISTEMA", "MEDIO",
+    // Bajo (operaciones normales o de sistema)
+    Action == "SELECT_CONSULTA" and TipoUsuario == "CUENTA_SISTEMA", "INFO",
+    TipoUsuario == "CUENTA_SISTEMA" or TipoUsuario == "CUENTA_MAQUINA", "BAJO",
+    "MEDIO"
 )
-| project 
-    TimeGenerated,
-    Computer,
-    Severity,
+// Resumen ejecutivo mejorado
+| extend Summary = strcat(
+    Executor, " (", TipoUsuario, ") ejecuto ",
     Action,
-    Executor,
-    Hour,
-    DayOfWeek,
-    IsWeekend,
-    IsNightTime,
-    RenderedDescription
-| order by Severity desc, TimeGenerated desc
+    iff(Succeeded == "false", " [FALLIDO]", ""),
+    iff(DatabaseName != "N/A", strcat(" en BD: ", DatabaseName), ""),
+    iff(TargetObject != "N/A", strcat(" -> ", TargetObject), "")
+)
+// Proyecto final
+| project 
+    FechaHora = TimeGenerated,
+    Dia = DayName,
+    Horario = TimeSlot,
+    Servidor = Computer,
+    Usuario = Executor,
+    TipoUsuario = TipoUsuario,
+    Accion = Action,
+    Exito = iff(Succeeded == "true", "SI", "NO"),
+    Severidad = Severity,
+    BaseDatos = DatabaseName,
+    Objeto = TargetObject,
+    Resumen = Summary,
+    Statement = SQLStatement,
+    DetallesCompletos = RenderedDescription
+| order by Severidad desc, FechaHora desc
+| take 100
+
