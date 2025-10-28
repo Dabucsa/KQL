@@ -1,0 +1,70 @@
+// ============================================
+// CAMBIOS DE PERMISOS, ROLES Y GRUPOS - AZURE ARC
+// GRANT, REVOKE, DENY, ADD MEMBER, sysadmin, db_owner
+// ============================================
+
+Event
+| where TimeGenerated >= ago(30d)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID == 33205
+| where RenderedDescription has_any (
+    "GRANT", "REVOKE", "DENY",
+    "ADD MEMBER", "DROP MEMBER",
+    "sp_addrolemember", "sp_droprolemember",
+    "sp_addsrvrolemember", "sp_dropsrvrolemember",
+    "sysadmin", "db_owner", "securityadmin", "serveradmin"
+)
+// Extracciones de usuario
+| extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
+| extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
+| extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription))
+| extend Usuario = coalesce(
+    iff(DatabasePrincipalName != "" and DatabasePrincipalName != "dbo", DatabasePrincipalName, ""),
+    iff(ServerPrincipalName != "", ServerPrincipalName, ""),
+    iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
+    "NO_IDENTIFICADO"
+)
+// Extracciones básicas
+| extend DatabaseName = trim(@"\s", extract(@"database_name:([^\s]+)", 1, RenderedDescription))
+| extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
+| extend Succeeded = extract(@"succeeded:([^\s]+)", 1, RenderedDescription)
+// Tipo de usuario
+| extend TipoUsuario = case(
+    Usuario contains "NT AUTHORITY" or Usuario contains "NT SERVICE", "CUENTA_SISTEMA",
+    Usuario endswith "$", "CUENTA_MAQUINA",
+    Usuario =~ "sa", "SA_ADMIN",
+    Usuario contains "\\", "CUENTA_DOMINIO",
+    "USUARIO_SQL"
+)
+// Clasificación de cambio
+| extend TipoCambio = case(
+    SQLStatement has "sysadmin", "SYSADMIN",
+    SQLStatement has "securityadmin", "SECURITYADMIN",
+    SQLStatement has "serveradmin", "SERVERADMIN",
+    SQLStatement has "db_owner", "DB_OWNER",
+    SQLStatement has "GRANT CONTROL", "GRANT_CONTROL",
+    SQLStatement has "GRANT ALTER", "GRANT_ALTER",
+    SQLStatement has "GRANT", "GRANT_PERMISO",
+    SQLStatement has "REVOKE", "REVOKE_PERMISO",
+    SQLStatement has "DENY", "DENY_PERMISO",
+    SQLStatement has "ADD MEMBER" or SQLStatement has "sp_addrolemember" or SQLStatement has "sp_addsrvrolemember", "AGREGAR_A_ROL",
+    SQLStatement has "DROP MEMBER" or SQLStatement has "sp_droprolemember" or SQLStatement has "sp_dropsrvrolemember", "QUITAR_DE_ROL",
+    "CAMBIO_PERMISO"
+)
+// Extracción de usuario/login afectado
+| extend UsuarioAfectado = extract(@"\[([^\]]+)\]|'([^']+)'", 1, SQLStatement)
+// Proyecto final
+| project 
+    FechaHora = TimeGenerated,
+    TipoCambio,
+    QuienHizoCambio = Usuario,
+    TipoUsuario,
+    UsuarioAfectado,
+    Servidor = Computer,
+    BaseDatos = iff(DatabaseName == "", "N/A", DatabaseName),
+    Exito = iff(Succeeded == "true", "SI", "NO"),
+    ComandoCompleto = SQLStatement,
+    DetallesCompletos = RenderedDescription
+| order by FechaHora desc
+| take 100
