@@ -1,0 +1,66 @@
+// ============================================
+// COMANDOS PELIGROSOS DE SISTEMA - AZURE ARC
+// Detecta xp_cmdshell, sp_configure, sp_addlinkedserver
+// Sin clasificación de riesgo (cliente decide criticidad)
+// ============================================
+Event
+| where TimeGenerated >= ago(30d)
+| where EventLog == "Application"
+| where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+| where EventID == 33205
+| where RenderedDescription has_any ("xp_cmdshell", "sp_configure", "sp_addlinkedserver")
+// Extracciones de usuario
+| extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
+| extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
+| extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription))
+| extend Usuario = coalesce(
+    iff(DatabasePrincipalName != "" and DatabasePrincipalName != "dbo", DatabasePrincipalName, ""),
+    iff(ServerPrincipalName != "", ServerPrincipalName, ""),
+    iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
+    "NO_IDENTIFICADO"
+)
+// Extracciones básicas
+| extend DatabaseName = trim(@"\s", extract(@"database_name:([^\s]+)", 1, RenderedDescription))
+| extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
+| extend ActionID = extract(@"action_id:([^\s]+)", 1, RenderedDescription)
+| extend Succeeded = extract(@"succeeded:([^\s]+)", 1, RenderedDescription)
+// Tipo de usuario
+| extend TipoUsuario = case(
+    Usuario contains "NT AUTHORITY" or Usuario contains "NT SERVICE", "CUENTA_SISTEMA",
+    Usuario endswith "$", "CUENTA_MAQUINA",
+    Usuario =~ "sa", "SA_ADMIN",
+    Usuario contains "\\", "CUENTA_DOMINIO",
+    "USUARIO_SQL"
+)
+// Identificación del tipo de comando
+| extend TipoComando = case(
+    SQLStatement has "xp_cmdshell" and SQLStatement has "ENABLE", "HABILITAR_XP_CMDSHELL",
+    SQLStatement has "xp_cmdshell" and SQLStatement has "DISABLE", "DESHABILITAR_XP_CMDSHELL",
+    SQLStatement has "xp_cmdshell", "EJECUTAR_COMANDO_OS",
+    SQLStatement has "sp_configure" and SQLStatement has "show advanced", "VER_CONFIGURACION_AVANZADA",
+    SQLStatement has "sp_configure" and SQLStatement has "xp_cmdshell", "CONFIGURAR_XP_CMDSHELL",
+    SQLStatement has "sp_configure", "MODIFICAR_CONFIGURACION_SERVIDOR",
+    SQLStatement has "sp_addlinkedserver", "AGREGAR_SERVIDOR_VINCULADO",
+    "COMANDO_SISTEMA"
+)
+// Extracción del parámetro si existe
+| extend ParametroComando = case(
+    SQLStatement has "sp_configure", extract(@"sp_configure\s+'([^']+)'", 1, SQLStatement),
+    SQLStatement has "xp_cmdshell", extract(@"xp_cmdshell\s+'([^']+)'", 1, SQLStatement),
+    "N/A"
+)
+// Proyecto final
+| project 
+    FechaHora = TimeGenerated,
+    TipoComando,
+    Usuario,
+    TipoUsuario,
+    Servidor = Computer,
+    BaseDatos = iff(DatabaseName == "", "N/A", DatabaseName),
+    Exito = iff(Succeeded == "true", "SI", "NO"),
+    Parametro = ParametroComando,
+    ComandoCompleto = SQLStatement,
+    ActionID,
+    DetallesCompletos = RenderedDescription
+| order by FechaHora desc
+| take 100
