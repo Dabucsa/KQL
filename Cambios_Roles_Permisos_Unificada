@@ -1,0 +1,166 @@
+// ============================================
+// CAMBIOS DE PERMISOS, ROLES Y GRUPOS - UNIFICADA
+// *** CON DESCRIPCIÓN DE ACCIÓN ***
+// ============================================
+
+// PARTE 1: AZURE ARC
+let ArcData = materialize(
+    Event
+    | where TimeGenerated >= ago(30d)
+    | where EventLog == "Application"
+    | where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+    | where EventID == 33205
+    | where RenderedDescription has_any (
+        "GRANT", "REVOKE", "DENY",
+        "ADD MEMBER", "DROP MEMBER",
+        "sp_addrolemember", "sp_droprolemember",
+        "sp_addsrvrolemember", "sp_dropsrvrolemember",
+        "sysadmin", "db_owner", "securityadmin", "serveradmin"
+    )
+    | top 100 by TimeGenerated desc
+    | extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
+    | extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
+    | extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription))
+    | extend Usuario = coalesce(
+        iff(DatabasePrincipalName != "" and DatabasePrincipalName != "dbo", DatabasePrincipalName, ""),
+        iff(ServerPrincipalName != "", ServerPrincipalName, ""),
+        iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
+        "NO_IDENTIFICADO"
+    )
+    | extend DatabaseName = trim(@"\s", extract(@"database_name:([^\s]+)", 1, RenderedDescription))
+    | extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
+    | extend Succeeded = extract(@"succeeded:([^\s]+)", 1, RenderedDescription)
+    | extend UsuarioAfectado_Arc = extract(@"database_principal_name:([^\s]+)", 1, RenderedDescription)
+    | extend Servidor = Computer
+    | extend Origen = "AzureArc"
+    | extend DetallesCompletos = RenderedDescription
+    | extend FechaEvento = TimeGenerated
+    | project FechaEvento, Servidor, Usuario, DatabaseName, SQLStatement, Succeeded, Origen, DetallesCompletos, UsuarioAfectado_Arc
+);
+// PARTE 2: LOGSTASH
+let LogstashData = materialize(
+    SQLAudit
+    | where ['TimeGenerated [UTC]'] >= ago(30d)
+    | where isnotempty(Statement)
+    | where Statement has_any (
+        "GRANT", "REVOKE", "DENY",
+        "ADD MEMBER", "DROP MEMBER",
+        "sp_addrolemember", "sp_droprolemember",
+        "sp_addsrvrolemember", "sp_dropsrvrolemember",
+        "sysadmin", "db_owner", "securityadmin", "serveradmin"
+    )
+    | extend EventTimeRaw = extract(@"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)", 1, Message)
+    | extend EventTime = todatetime(EventTimeRaw)
+    | extend FechaHoraEvento = coalesce(EventTime, ['TimeGenerated [UTC]'])
+    | top 100 by FechaHoraEvento desc 
+    | extend MessageParts = split(Message, "|")
+    | extend Usuario_DelMessage = tostring(MessageParts[7])
+    | extend UsuarioAfectado_DelMessage = tostring(MessageParts[8])
+    | extend BD_DelMessage = tostring(MessageParts[9]) 
+    | extend Usuario = case(
+        isnotempty(Usuario_DelMessage) and Usuario_DelMessage != "NULL" and Usuario_DelMessage != "", Usuario_DelMessage,
+        isnotempty(CurrentUser), CurrentUser,
+        "DESCONOCIDO"
+    )
+    | extend Servidor = coalesce(Server_name, Instance, tostring(MessageParts[1]), "DESCONOCIDO")   
+    | extend EsCambioServidor = case(
+        Statement has "sp_addsrvrolemember", true,
+        Statement has "sp_dropsrvrolemember", true,
+        Statement has "ALTER SERVER ROLE", true,
+        Statement contains "sysadmin" or Statement contains "securityadmin" or Statement contains "serveradmin", true,
+        false
+    ) 
+    | extend DatabaseName = case(
+        isnotempty(Database) and Database != "" and Database != "NULL", Database,
+        isnotempty(BD_DelMessage) and BD_DelMessage != "" and BD_DelMessage != "NULL", BD_DelMessage,
+        EsCambioServidor == true, "master",
+        ""
+    )   
+    | extend UsuarioAfectado_LS = iff(
+        isnotempty(UsuarioAfectado_DelMessage) and UsuarioAfectado_DelMessage != "NULL",
+        UsuarioAfectado_DelMessage,
+        ""
+    )
+    | extend SQLStatement = Statement
+    | extend Succeeded = "true"
+    | extend Origen = "Logstash"
+    | extend DetallesCompletos = Message
+    | extend FechaEvento = FechaHoraEvento
+    | project FechaEvento, Servidor, Usuario, DatabaseName, SQLStatement, Succeeded, Origen, DetallesCompletos, UsuarioAfectado_LS
+);
+// UNION Y PROCESAMIENTO
+union isfuzzy=true ArcData, LogstashData
+| extend TipoUsuario = case(
+    Usuario contains "NT AUTHORITY" or Usuario contains "NT SERVICE", "CUENTA_SISTEMA",
+    Usuario endswith "$", "CUENTA_MAQUINA",
+    Usuario =~ "sa", "SA_ADMIN",
+    Usuario contains "\\", "CUENTA_DOMINIO",
+    "USUARIO_SQL"
+)
+| extend TipoCambio = case(
+    SQLStatement contains "sysadmin" or SQLStatement contains "'sysadmin'" or SQLStatement contains "[sysadmin]" or SQLStatement contains "N'sysadmin'", "SYSADMIN",
+    SQLStatement contains "securityadmin" or SQLStatement contains "'securityadmin'" or SQLStatement contains "[securityadmin]", "SECURITYADMIN",
+    SQLStatement contains "serveradmin" or SQLStatement contains "'serveradmin'" or SQLStatement contains "[serveradmin]", "SERVERADMIN",
+    SQLStatement contains "db_owner" or SQLStatement contains "'db_owner'" or SQLStatement contains "[db_owner]", "DB_OWNER",
+    SQLStatement contains "db_securityadmin" or SQLStatement contains "'db_securityadmin'", "DB_SECURITYADMIN",
+    SQLStatement contains "db_accessadmin" or SQLStatement contains "'db_accessadmin'", "DB_ACCESSADMIN",
+    SQLStatement contains "db_ddladmin" or SQLStatement contains "'db_ddladmin'", "DB_DDLADMIN",
+    SQLStatement has "GRANT CONTROL", "GRANT_CONTROL",
+    SQLStatement has "GRANT ALTER", "GRANT_ALTER",
+    SQLStatement has "GRANT", "GRANT_PERMISO",
+    SQLStatement has "REVOKE", "REVOKE_PERMISO",
+    SQLStatement has "DENY", "DENY_PERMISO",
+    SQLStatement has "ADD MEMBER" or SQLStatement has "sp_addrolemember" or SQLStatement has "sp_addsrvrolemember", "AGREGAR_A_ROL",
+    SQLStatement has "DROP MEMBER" or SQLStatement has "sp_droprolemember" or SQLStatement has "sp_dropsrvrolemember", "QUITAR_DE_ROL",
+    "CAMBIO_PERMISO"
+)
+// *** NUEVA: DESCRIPCIÓN DE LA ACCIÓN ***
+| extend TipoAccion = case(
+    SQLStatement has "sp_addsrvrolemember" or SQLStatement has "ALTER SERVER ROLE" and SQLStatement has "ADD MEMBER", "AGREGAR",
+    SQLStatement has "sp_dropsrvrolemember" or SQLStatement has "ALTER SERVER ROLE" and SQLStatement has "DROP MEMBER", "QUITAR",
+    SQLStatement has "sp_addrolemember" or SQLStatement has "ADD MEMBER", "AGREGAR",
+    SQLStatement has "sp_droprolemember" or SQLStatement has "DROP MEMBER", "QUITAR",
+    SQLStatement has "GRANT", "OTORGAR",
+    SQLStatement has "REVOKE", "REVOCAR",
+    SQLStatement has "DENY", "DENEGAR",
+    "CAMBIAR"
+)
+| extend DescripcionAccion = case(
+    TipoCambio == "SYSADMIN", strcat(TipoAccion, " rol SYSADMIN (Admin Total Servidor)"),
+    TipoCambio == "SECURITYADMIN", strcat(TipoAccion, " rol SECURITYADMIN (Gestión de Seguridad)"),
+    TipoCambio == "SERVERADMIN", strcat(TipoAccion, " rol SERVERADMIN (Configuración Servidor)"),
+    TipoCambio == "DB_OWNER", strcat(TipoAccion, " rol DB_OWNER (Dueño BD)"),
+    TipoCambio == "DB_SECURITYADMIN", strcat(TipoAccion, " rol DB_SECURITYADMIN (Seguridad BD)"),
+    TipoCambio == "DB_ACCESSADMIN", strcat(TipoAccion, " rol DB_ACCESSADMIN (Acceso BD)"),
+    TipoCambio == "DB_DDLADMIN", strcat(TipoAccion, " rol DB_DDLADMIN (Estructura BD)"),
+    TipoCambio == "GRANT_CONTROL", "OTORGAR permiso CONTROL (Control Total)",
+    TipoCambio == "GRANT_ALTER", "OTORGAR permiso ALTER (Modificar Objetos)",
+    TipoCambio == "GRANT_PERMISO", "OTORGAR permiso específico",
+    TipoCambio == "REVOKE_PERMISO", "REVOCAR permiso",
+    TipoCambio == "DENY_PERMISO", "DENEGAR permiso",
+    TipoCambio == "AGREGAR_A_ROL", strcat(TipoAccion, " a rol de BD"),
+    TipoCambio == "QUITAR_DE_ROL", strcat(TipoAccion, " de rol de BD"),
+    "Cambio de permiso"
+)
+| extend UsuarioAfectado = coalesce(
+    UsuarioAfectado_LS,
+    UsuarioAfectado_Arc,
+    extract(@"\[([^\]]+)\]|@loginame\s*=\s*N?'([^']+)'|'([^']+)'", 1, SQLStatement),
+    "N/A"
+)
+| extend BaseDatos = iff(isempty(DatabaseName) or isnull(DatabaseName), "N/A", DatabaseName)
+| project 
+    FechaHora = FechaEvento,
+    TipoCambio,
+    DescripcionAccion,  // *** NUEVA COLUMNA ***
+    QuienHizoCambio = Usuario,
+    TipoUsuario,
+    UsuarioAfectado,
+    Servidor,
+    BaseDatos,
+    Exito = iff(Succeeded == "true", "SI", "NO"),
+    ComandoCompleto = SQLStatement,
+    OrigenDatos = Origen,
+    DetallesCompletos
+| order by FechaHora desc
+| take 200
