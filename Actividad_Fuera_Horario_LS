@@ -1,8 +1,8 @@
 // ============================================
 // QUERY PARA LOGSTASH (SQLAudit)
-// Detectar actividad administrativa fuera de horario
+// Detectar actividad administrativa FUERA DE HORARIO
+// *** CORREGIDO: Usa hora real del evento SQL ***
 // ============================================
-
 SQLAudit
 | where ['TimeGenerated [UTC]'] >= ago(7d)
 | where isnotempty(Statement)
@@ -11,13 +11,17 @@ SQLAudit
     "sp_configure", "xp_cmdshell", "ADD MEMBER", "DROP MEMBER", "DENY",
     "UPDATE", "INSERT", "DELETE", "BACKUP", "RESTORE", "TRUNCATE"
 )
-// Cálculos de tiempo
-| extend Hour = hourofday(['TimeGenerated [UTC]'])
-| extend DayOfWeek = dayofweek(['TimeGenerated [UTC]'])
+// *** EXTRACCIÓN DE HORA REAL DEL EVENTO SQL ***
+| extend EventTimeRaw = extract(@"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)", 1, Message)
+| extend EventTime = todatetime(EventTimeRaw)
+| extend FechaHoraEvento = coalesce(EventTime, ['TimeGenerated [UTC]'])  // Fallback si no se extrae
+// Cálculos de tiempo CORREGIDOS (usando hora del evento SQL)
+| extend Hour = hourofday(FechaHoraEvento)
+| extend DayOfWeek = dayofweek(FechaHoraEvento)
 | extend IsWeekend = iff(DayOfWeek == 0d or DayOfWeek == 6d, true, false)
 | extend IsNightTime = iff(Hour < 6 or Hour >= 22, true, false)
 | extend IsOffHours = iff(IsWeekend or IsNightTime, true, false)
-| where IsOffHours == true
+| where IsOffHours == true  // *** SOLO FUERA DE HORARIO ***
 // Formato legible de fecha y hora
 | extend DayName = case(
     DayOfWeek == 0d, "Domingo",
@@ -131,7 +135,8 @@ SQLAudit
 )
 // Proyecto final
 | project 
-    FechaHora = ['TimeGenerated [UTC]'],
+    FechaHora = FechaHoraEvento,  // *** HORA REAL DEL EVENTO SQL ***
+    HoraIngesta = ['TimeGenerated [UTC]'],  // *** OPCIONAL: hora de llegada a Log Analytics ***
     Dia = DayName,
     Horario = TimeSlot,
     Servidor = Servidor,
