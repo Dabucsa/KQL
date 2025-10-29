@@ -1,0 +1,119 @@
+// ============================================
+// RESUMEN ACTIVIDADES FUERA DE HORARIO - AYER - UNIFICADA
+// Azure Arc + Logstash
+// Resumen ejecutivo de actividad del día anterior fuera de horario laboral
+// ============================================
+// Horario laboral: 8:00 AM - 6:00 PM (UTC)
+// Día analizado: Ayer completo (00:00 - 23:59)
+// ============================================
+let HoraInicioLaboral = 8;   // 8 AM
+let HoraFinLaboral = 18;      // 6 PM
+// Definir rango: AYER completo
+let InicioAyer = startofday(ago(1d));
+let FinAyer = endofday(ago(1d));
+// ============================================
+// PARTE 1: AZURE ARC
+// ============================================
+let ArcData = materialize(
+    Event
+    | where TimeGenerated >= InicioAyer and TimeGenerated <= FinAyer
+    | where EventLog == "Application"
+    | where Source has_any ("MSSQLSERVER","MSSQL$","SQLSERVERAGENT")
+    | where EventID == 33205
+    | extend ServerPrincipalName = trim(@"\s", extract(@"server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_sid:|$)", 1, RenderedDescription))
+    | extend SessionServerPrincipalName = trim(@"\s", extract(@"session_server_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+server_principal_name:|$)", 1, RenderedDescription))
+    | extend DatabasePrincipalName = trim(@"\s", extract(@"database_principal_name:([^\s]+(?:\s+[^\s]+)*?)(?:\s+target_server_principal_name:|$)", 1, RenderedDescription)) 
+    | extend Usuario = coalesce(
+        iff(DatabasePrincipalName != "" and DatabasePrincipalName != "dbo", DatabasePrincipalName, ""),
+        iff(ServerPrincipalName != "", ServerPrincipalName, ""),
+        iff(SessionServerPrincipalName != "", SessionServerPrincipalName, ""),
+        "NO_IDENTIFICADO"
+    )
+    | extend DatabaseName = trim(@"\s", extract(@"database_name:([^\s]+)", 1, RenderedDescription))
+    | extend SQLStatement = trim(@"\s", extract(@"statement:([^\s]+(?:\s+[^\s]+)*?)(?:\s+additional_information:|$)", 1, RenderedDescription))
+    | extend HoraDelDia = hourofday(TimeGenerated)
+    | extend EsFueraHorario = iff(HoraDelDia < HoraInicioLaboral or HoraDelDia >= HoraFinLaboral, "SI", "NO")
+    | where EsFueraHorario == "SI"   
+    | extend Servidor = Computer
+    | extend BaseDatos = iff(isempty(DatabaseName), "N/A", DatabaseName)
+    | extend FechaHora = TimeGenerated
+    | extend Origen = "AzureArc" 
+    | project FechaHora, Origen, Servidor, Usuario, BaseDatos, SQLStatement
+);
+
+// ============================================
+// PARTE 2: LOGSTASH
+// ============================================
+let LogstashData = materialize(
+    SQLAudit
+    | where ['TimeGenerated [UTC]'] >= InicioAyer and ['TimeGenerated [UTC]'] <= FinAyer
+    | where isnotempty(Statement)
+    | extend EventTimeRaw = extract(@"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)", 1, Message)
+    | extend EventTime = todatetime(EventTimeRaw)
+    | extend FechaHoraEvento = coalesce(EventTime, ['TimeGenerated [UTC]'])
+    | extend HoraDelDia = hourofday(FechaHoraEvento)
+    | extend EsFueraHorario = iff(HoraDelDia < HoraInicioLaboral or HoraDelDia >= HoraFinLaboral, "SI", "NO")
+    | where EsFueraHorario == "SI"
+    | extend MessageParts = split(Message, "|")
+    | extend Usuario_DelMessage = tostring(MessageParts[7])
+    | extend Usuario = case(
+        isnotempty(Usuario_DelMessage) and Usuario_DelMessage != "NULL" and Usuario_DelMessage != "", Usuario_DelMessage,
+        isnotempty(CurrentUser), CurrentUser,
+        "DESCONOCIDO"
+    )
+    | extend Servidor = coalesce(Server_name, Instance, tostring(MessageParts[1]), "DESCONOCIDO")
+    | extend BaseDatos = coalesce(Database, "N/A")
+    | extend SQLStatement = Statement
+    | extend FechaHora = FechaHoraEvento
+    | extend Origen = "Logstash"
+    | project FechaHora, Origen, Servidor, Usuario, BaseDatos, SQLStatement
+);
+// ============================================
+// UNIÓN Y PROCESAMIENTO
+// ============================================
+union isfuzzy=true ArcData, LogstashData
+// Clasificación de actividad
+| extend TipoActividad = case(
+    SQLStatement has_any ("xp_cmdshell", "sp_configure", "sp_addlinkedserver"), "COMANDO_CRITICO",
+    SQLStatement has_any ("sysadmin", "securityadmin", "serveradmin"), "CAMBIO_ROL_SERVIDOR",
+    SQLStatement has_any ("GRANT", "REVOKE", "DENY", "ADD MEMBER", "DROP MEMBER"), "CAMBIO_PERMISOS",
+    SQLStatement has_any ("CREATE LOGIN", "DROP LOGIN", "ALTER LOGIN"), "GESTION_LOGIN",
+    SQLStatement has_any ("CREATE DATABASE", "DROP DATABASE", "ALTER DATABASE"), "GESTION_BD",
+    SQLStatement has_any ("DROP TABLE", "TRUNCATE"), "OPERACION_TABLA",
+    SQLStatement has_any ("BACKUP DATABASE", "RESTORE DATABASE"), "BACKUP_RESTORE",
+    SQLStatement has "INSERT", "INSERT",
+    SQLStatement has "UPDATE", "UPDATE",
+    SQLStatement has "DELETE", "DELETE",
+    SQLStatement has "SELECT", "SELECT",
+    "OTRO"
+)
+// RESUMEN POR CATEGORÍAS Y ORIGEN
+| summarize 
+    TotalEventos = count(),
+    Usuarios = dcount(Usuario),
+    Servidores = dcount(Servidor),
+    BaseDatos = dcount(BaseDatos),
+    PrimerEvento = min(FechaHora),
+    UltimoEvento = max(FechaHora),
+    UsuariosDetalle = make_set(Usuario, 10),
+    ServidoresDetalle = make_set(Servidor, 10),
+    EjemploComando = take_any(SQLStatement),
+    EventosArc = countif(Origen == "AzureArc"),
+    EventosLogstash = countif(Origen == "Logstash")
+    by TipoActividad
+| extend FechaAnalizada = format_datetime(ago(1d), 'yyyy-MM-dd')
+| project 
+    FechaAnalizada,
+    TipoActividad,
+    TotalEventos,
+    EventosArc,
+    EventosLogstash,
+    Usuarios,
+    Servidores,
+    BaseDatos,
+    PrimerEvento = format_datetime(PrimerEvento, 'yyyy-MM-dd HH:mm:ss'),
+    UltimoEvento = format_datetime(UltimoEvento, 'yyyy-MM-dd HH:mm:ss'),
+    UsuariosDetalle,
+    ServidoresDetalle,
+    EjemploComando
+| order by TotalEventos desc
